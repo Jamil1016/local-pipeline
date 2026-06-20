@@ -1,0 +1,74 @@
+# Environment files
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Logs
+*.log
+
+# Gmail API credentials
+gmail_credentials/
+token.pickle
+
+# Large data exports
+swift_api_pipeline/daily_reports_export/
+swift_api_pipeline/*.xlsx
+swift_api_pipeline/*_entries_to_unremove.txt
+swift_api_pipeline/*_bulk_cleanup_entry_ids.txt
+swift_api_pipeline/*_manual_entry_ids.txt
+swift_api_pipeline/*_disc_corrections_for_review.txt
+swift_api_pipeline/_temp_*
+
+# Scripts reference archives
+scripts-reference/*.zip
+scripts-reference/*.xlsx
+scripts-reference/*.png
+scripts-reference/credentials.*
+scripts-reference/data_sample/
+scripts-reference/aging_reference/
+scripts-reference/asset_task_extract/
+scripts-reference/qa_form_reference/
+scripts-reference/sales_reference/
+
+# Temp files
+~$*
+pipeline-timing-*.md
+presentation/~$*
+presentation/*.html
+presentation/*.pptx
+presentation/*.py
+
+# Temp/utility scripts (prefixed with _)
+swift_api_pipeline/_*.py
+swift_api_pipeline/gen_test.py
+
+# Schema metadata exports
+swift_api_pipeline/docs/*.xlsx
+
+# Migration helpers
+swift_api_pipeline/migrations/apply_*.py
+swift_api_pipeline/migrations/export_*.py
+
+# Validation scripts
+swift_api_pipeline/db_schema_validation.py
+
+# PowerShell scripts
+*.ps1

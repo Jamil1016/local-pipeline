@@ -1,0 +1,84 @@
+name: "Pipeline: User Priorities"
+
+on:
+  repository_dispatch:
+    types: [pipeline-priorities]
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-priorities
+  cancel-in-progress: false
+
+env:
+  PIPELINE_DIR: swift_api_pipeline
+
+jobs:
+  priorities:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create .env
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          cat > .env <<'DOTENV'
+          SWIFT_EMAIL=mgmt@example.com
+          SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+          SUPABASE_HOST=aws-0-ap-southeast-1.pooler.supabase.com
+          SUPABASE_PORT=5432
+          SUPABASE_DB=postgres
+          SUPABASE_USER=postgres.YOUR_PROJECT_REF
+          SWIFT_PASSWORD=${{ secrets.SWIFT_PASSWORD }}
+          SUPABASE_PASSWORD=${{ secrets.SUPABASE_PASSWORD }}
+          DOTENV
+
+      - name: Decode notifier credentials
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          mkdir -p gmail_credentials
+          echo "${{ secrets.NOTIFIER_CREDENTIALS_JSON }}" | base64 -d > gmail_credentials/credentials.json
+          echo "${{ secrets.NOTIFIER_TOKEN_PICKLE }}" | base64 -d > gmail_credentials/token.pickle
+
+      - name: Decode shared Drive token
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: echo "${{ secrets.DRIVE_SHARED_TOKEN_PICKLE }}" | base64 -d > gmail_credentials/drive_shared_token.pickle
+
+      - name: Run user_priorities pipeline (with retry)
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          python -u main.py --pipeline user_priorities || {
+            echo "User priorities failed, retrying after 2 minutes..."
+            sleep 120
+            python -u main.py --pipeline user_priorities
+          }
+
+      - name: Export user priorities
+        working-directory: scripts-reference
+        run: |
+          echo "User priorities pipeline succeeded — running export..."
+          python -u export_user_priorities_excel.py --no-upload
+
+      - name: Upload user priorities to shared Drive
+        working-directory: scripts-reference
+        continue-on-error: true
+        run: python -u upload_to_shared_drive.py --export user_priorities
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: priorities-logs
+          path: '${{ env.PIPELINE_DIR }}/pipeline_logs/*.log'
+          retention-days: 7

@@ -1,0 +1,146 @@
+name: "Pipeline: Open Items Report Data"
+
+# Refreshes the two report-scoped Swift snapshots the Open Items Report
+# reads from:
+#   1. data_staging.stg_targeted_asset_tasks         (asset task list,
+#      includes Final COP task_approved_on used as BetaSites lookup)
+#   2. data_staging.stg_targeted_task_requirements   (one row per open
+#      punch requirement; depends on stg_user_priorities being fresh)
+#
+# Trigger order matters:
+#   - targeted_asset_tasks first (no upstream dependency beyond Swift)
+#   - targeted_task_requirements second (reads stg_user_priorities to
+#     decide which task_dids to fetch requirements for, so we want
+#     user_priorities to be fresh -> this workflow is fired by the
+#     Apps Script *after* pipeline-priorities completes)
+
+on:
+  repository_dispatch:
+    types: [pipeline-open-items-data]
+  workflow_dispatch:
+
+# No GHA cron — the Apps Script triggerOpenItemsData (~02:00 ET) is the
+# sole scheduled trigger. End-of-run, this workflow chains to
+# open-items-report-email in report-automation (Mon/Fri only) so the
+# email fires when the data is fresh, not on an independent schedule.
+
+concurrency:
+  group: pipeline-open-items-data
+  cancel-in-progress: false
+
+env:
+  PIPELINE_DIR: swift_api_pipeline
+
+jobs:
+  refresh-open-items-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create .env
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          cat > .env <<'DOTENV'
+          SWIFT_EMAIL=mgmt@example.com
+          SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+          SUPABASE_HOST=aws-0-ap-southeast-1.pooler.supabase.com
+          SUPABASE_PORT=5432
+          SUPABASE_DB=postgres
+          SUPABASE_USER=postgres.YOUR_PROJECT_REF
+          SWIFT_PASSWORD=${{ secrets.SWIFT_PASSWORD }}
+          SUPABASE_PASSWORD=${{ secrets.SUPABASE_PASSWORD }}
+          DOTENV
+
+      - name: Decode notifier credentials
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          mkdir -p gmail_credentials
+          echo "${{ secrets.NOTIFIER_CREDENTIALS_JSON }}" | base64 -d > gmail_credentials/credentials.json
+          echo "${{ secrets.NOTIFIER_TOKEN_PICKLE }}" | base64 -d > gmail_credentials/token.pickle
+
+      # ---------- Step 1: targeted_asset_tasks ----------
+      # Snapshots Swift's asset-task list for every (org, project) in
+      # reference.report_targets where enabled=TRUE. Captures
+      # task_approved_on for Final COP enrichment (BetaSites).
+      - name: Run targeted_asset_tasks pipeline (with retry)
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          python -u main.py --pipeline targeted_asset_tasks --no-email || {
+            echo "targeted_asset_tasks failed, retrying after 2 minutes..."
+            sleep 120
+            python -u main.py --pipeline targeted_asset_tasks --no-email
+          }
+
+      # ---------- Step 2: targeted_task_requirements ----------
+      # Reads stg_user_priorities (refreshed earlier in the chain by
+      # pipeline-priorities) to find open punch tasks, then fetches
+      # their per-requirement detail from Swift.
+      - name: Run targeted_task_requirements pipeline (with retry)
+        working-directory: ${{ env.PIPELINE_DIR }}
+        env:
+          REPORT_NAME: open_items_report
+        run: |
+          python -u main.py --pipeline targeted_task_requirements --no-email || {
+            echo "targeted_task_requirements failed, retrying after 2 minutes..."
+            sleep 120
+            python -u main.py --pipeline targeted_task_requirements --no-email
+          }
+
+      # ---------- Step 3: Dispatch open-items-report-email (Mon/Fri only) ----------
+      # Event-driven hand-off: when data refresh succeeds, immediately fire
+      # the email workflow in report-automation. DOW gate keeps the email
+      # to its weekly cadence (Mon: AT&T + TMO groups, Fri: NSB Macro).
+      # On Tue/Wed/Thu/Sat/Sun the data still refreshes but no email goes
+      # out. Reuses DATE_VALIDATOR_DISPATCH_PAT (same PAT pipeline-asset-tasks
+      # uses for cross-repo dispatch to report-automation).
+      - name: Dispatch open-items-report-email (Mon/Fri only, cross-repo)
+        continue-on-error: true
+        run: |
+          # Day-of-week in America/New_York (not UTC — boundary matters near midnight).
+          DOW=$(TZ='America/New_York' date +%u)   # 1=Mon ... 7=Sun
+          if [ "$DOW" = "1" ]; then
+            EVENT_TYPE="open-items-report-monday"
+            CADENCE="monday"
+          elif [ "$DOW" = "5" ]; then
+            EVENT_TYPE="open-items-report-friday"
+            CADENCE="friday"
+          else
+            echo "Not Mon/Fri (ET dow=$DOW) — data refreshed, skipping email dispatch."
+            exit 0
+          fi
+
+          if [ -z "${{ secrets.DATE_VALIDATOR_DISPATCH_PAT }}" ]; then
+            echo "WARN: DATE_VALIDATOR_DISPATCH_PAT not set — skipping cross-repo dispatch"
+            exit 0
+          fi
+
+          response=$(curl -sw '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${{ secrets.DATE_VALIDATOR_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/jamilmendez-internal/report-automation/dispatches" \
+            -d "{\"event_type\": \"${EVENT_TYPE}\", \"client_payload\": {\"cadence\": \"${CADENCE}\", \"source\": \"gha-pipeline-open-items-data\"}}")
+          code=$(echo "$response" | tail -n1)
+          echo "Dispatched ${EVENT_TYPE} -> HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "WARN: ${EVENT_TYPE} dispatch failed; check PAT has report-automation scope"
+          fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-items-data-logs
+          path: '${{ env.PIPELINE_DIR }}/pipeline_logs/*.log'
+          retention-days: 7

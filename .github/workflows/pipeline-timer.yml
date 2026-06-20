@@ -1,0 +1,122 @@
+name: "Pipeline: Timer"
+
+on:
+  repository_dispatch:
+    types: [pipeline-timer]
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-timer
+  cancel-in-progress: false
+
+env:
+  PIPELINE_DIR: swift_api_pipeline
+
+jobs:
+  timer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create .env
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          cat > .env <<'DOTENV'
+          SWIFT_EMAIL=mgmt@example.com
+          SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+          SUPABASE_HOST=aws-0-ap-southeast-1.pooler.supabase.com
+          SUPABASE_PORT=5432
+          SUPABASE_DB=postgres
+          SUPABASE_USER=postgres.YOUR_PROJECT_REF
+          SWIFT_PASSWORD=${{ secrets.SWIFT_PASSWORD }}
+          SUPABASE_PASSWORD=${{ secrets.SUPABASE_PASSWORD }}
+          DOTENV
+
+      - name: Decode notifier credentials
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          mkdir -p gmail_credentials
+          echo "${{ secrets.NOTIFIER_CREDENTIALS_JSON }}" | base64 -d > gmail_credentials/credentials.json
+          echo "${{ secrets.NOTIFIER_TOKEN_PICKLE }}" | base64 -d > gmail_credentials/token.pickle
+          echo "${{ secrets.SHEETS_TOKEN_PICKLE }}" | base64 -d > gmail_credentials/sheets_token.pickle
+
+      - name: Run timer pipeline (with retry)
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: |
+          python -u main.py --pipeline timer || {
+            echo "Timer failed, retrying after 2 minutes..."
+            sleep 120
+            python -u main.py --pipeline timer
+          }
+
+      - name: Decode shared Drive token
+        working-directory: ${{ env.PIPELINE_DIR }}
+        run: echo "${{ secrets.DRIVE_SHARED_TOKEN_PICKLE }}" | base64 -d > gmail_credentials/drive_shared_token.pickle
+
+      - name: Export timer data
+        working-directory: scripts-reference
+        run: |
+          echo "Timer pipeline succeeded — running export..."
+          python -u export_timer_excel.py
+
+      - name: Upload timer to shared Drive
+        working-directory: scripts-reference
+        continue-on-error: true
+        run: python -u upload_to_shared_drive.py --export timer
+
+      - name: Timer corrections - apply pending
+        working-directory: ${{ env.PIPELINE_DIR }}
+        continue-on-error: true
+        run: python -u timer_correction_review.py --apply
+
+      - name: Export clean timer data
+        working-directory: scripts-reference
+        continue-on-error: true
+        run: python -u export_timer_clean_excel.py
+
+      - name: Upload clean timer to shared Drive
+        working-directory: scripts-reference
+        continue-on-error: true
+        run: python -u upload_to_shared_drive.py --export timer-clean
+
+      - name: Timer corrections - remind duplicates
+        working-directory: ${{ env.PIPELINE_DIR }}
+        continue-on-error: true
+        # Remind runs BEFORE send so it only covers previous days' duplicates
+        run: python -u timer_correction_review.py --remind
+
+      - name: Timer corrections - send daily entries
+        working-directory: ${{ env.PIPELINE_DIR }}
+        continue-on-error: true
+        run: python -u timer_correction_review.py --send
+
+      - name: Timer corrections - resend changed days
+        working-directory: ${{ env.PIPELINE_DIR }}
+        continue-on-error: true
+        # Runs after --send so today's snapshot is fresh. Threaded re-sends
+        # fire for prior days in the lookback window whose entry set has
+        # new IDs (NULL-end timers that materialized, manual additions).
+        # Re-enabled 2026-05-22 after the stable-resend-key fix + snapshot
+        # rebase. Compare-against-pre-stored-snapshot now uses a hash that
+        # ignores NUMERIC duration_min precision tails.
+        run: python -u timer_correction_review.py --resend
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timer-logs
+          path: '${{ env.PIPELINE_DIR }}/pipeline_logs/*.log'
+          retention-days: 7
